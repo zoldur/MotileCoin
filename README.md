@@ -46,8 +46,8 @@ For security reasons **Motile** is installed under **motile** user, hence you ne
 MOTILE_USER=motile #replace motile with the MN username you want to check
 
 su - $MOTILE_USER  
-Motiletd masternode status  
-Motiletd getinfo  
+Motiled masternode status  
+Motiled getinfo  
 ```  
 
 Also, if you want to check/start/stop **Motile** , run one of the following commands as **root**:
