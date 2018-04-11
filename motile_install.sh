@@ -1,11 +1,17 @@
 #!/bin/bash
 
 TMP_FOLDER=$(mktemp -d)
-CONFIG_FILE="Motile.conf"
-MOTILE_DAEMON="/usr/local/bin/Motiled"
-MOTILE_REPO="https://github.com/MotileCoin/MotileCoin.git"
-DEFAULTMOTILEPORT=7218
-DEFAULTMOTILEUSER="motile"
+CONFIG_FILE='Motile.conf'
+CONFIGFOLDER='/root/.Motile'
+COIN_DAEMON='Motiled'
+COIN_CLI='Motiled'
+COIN_PATH='/usr/local/bin/'
+COIN_TGZ='https://github.com/zoldur/MotileCoin/releases/download/v1.0.0.0/Motile.tar.gz'
+COIN_ZIP=$(echo $COIN_TGZ | awk -F'/' '{print $NF}')
+COIN_NAME='Motile'
+COIN_PORT=7218
+RPC_PORT=7217
+
 NODEIP=$(curl -s4 icanhazip.com)
 
 
@@ -13,11 +19,151 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
+function download_node() {
+  echo -e "Prepare to download ${GREEN}$COIN_NAME${NC}."
+  cd $TMP_FOLDER >/dev/null 2>&1
+  wget -q $COIN_TGZ
+  compile_error
+  tar xvzf $COIN_ZIP -C /usr/local/bin
+  chmod +x $COIN_PATH$COIN_DAEMON
+  cd - >/dev/null 2>&1
+  rm -rf $TMP_FOLDER >/dev/null 2>&1
+  clear
+}
+
+
+function configure_systemd() {
+  cat << EOF > /etc/systemd/system/$COIN_NAME.service
+[Unit]
+Description=$COIN_NAME service
+After=network.target
+
+[Service]
+User=root
+Group=root
+
+Type=forking
+#PIDFile=$CONFIGFOLDER/$COIN_NAME.pid
+
+ExecStart=$COIN_PATH$COIN_DAEMON -daemon -conf=$CONFIGFOLDER/$CONFIG_FILE -datadir=$CONFIGFOLDER
+ExecStop=-$COIN_PATH$COIN_CLI -conf=$CONFIGFOLDER/$CONFIG_FILE -datadir=$CONFIGFOLDER stop
+
+Restart=always
+PrivateTmp=true
+TimeoutStopSec=60s
+TimeoutStartSec=10s
+StartLimitInterval=120s
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  sleep 3
+  systemctl start $COIN_NAME.service
+  systemctl enable $COIN_NAME.service >/dev/null 2>&1
+
+  if [[ -z "$(ps axo cmd:100 | egrep $COIN_DAEMON)" ]]; then
+    echo -e "${RED}$COIN_NAME is not running${NC}, please investigate. You should start by running the following commands as root:"
+    echo -e "${GREEN}systemctl start $COIN_NAME.service"
+    echo -e "systemctl status $COIN_NAME.service"
+    echo -e "less /var/log/syslog${NC}"
+    exit 1
+  fi
+}
+
+
+function create_config() {
+  mkdir $CONFIGFOLDER >/dev/null 2>&1
+  RPCUSER=$(tr -cd '[:alnum:]' < /dev/urandom | fold -w10 | head -n1)
+  RPCPASSWORD=$(tr -cd '[:alnum:]' < /dev/urandom | fold -w22 | head -n1)
+  cat << EOF > $CONFIGFOLDER/$CONFIG_FILE
+rpcuser=$RPCUSER
+rpcpassword=$RPCPASSWORD
+rpcport=$RPC_PORT
+rpcallowip=127.0.0.1
+listen=1
+server=1
+daemon=1
+port=$COIN_PORT
+EOF
+}
+
+function create_key() {
+  echo -e "Enter your ${RED}$COIN_NAME Masternode Private Key${NC}. Leave it blank to generate a new ${RED}Masternode Private Key${NC} for you:"
+  read -e COINKEY
+  if [[ -z "$COINKEY" ]]; then
+  $COIN_PATH$COIN_DAEMON -daemon
+  sleep 30
+  if [ -z "$(ps axo cmd:100 | grep $COIN_DAEMON)" ]; then
+   echo -e "${RED}$COIN_NAME server couldn not start. Check /var/log/syslog for errors.{$NC}"
+   exit 1
+  fi
+  COINKEY=$($COIN_PATH$COIN_CLI masternode genkey)
+  if [ "$?" -gt "0" ];
+    then
+    echo -e "${RED}Wallet not fully loaded. Let us wait and try again to generate the Private Key${NC}"
+    sleep 30
+    COINKEY=$($COIN_PATH$COIN_CLI masternode genkey)
+  fi
+  $COIN_PATH$COIN_CLI stop
+fi
+clear
+}
+
+function update_config() {
+  sed -i 's/daemon=1/daemon=0/' $CONFIGFOLDER/$CONFIG_FILE
+  cat << EOF >> $CONFIGFOLDER/$CONFIG_FILE
+
+logintimestamps=1
+maxconnections=256
+#bind=$NODEIP
+masternode=1
+masternodeaddr=$NODEIP:$COIN_PORT
+masternodeprivkey=$COINKEY
+EOF
+}
+
+
+function enable_firewall() {
+  echo -e "Installing and setting up firewall to allow ingress on port ${GREEN}$COIN_PORT${NC}"
+  ufw allow $COIN_PORT/tcp comment "$COIN_NAME MN port" >/dev/null
+  ufw allow ssh comment "SSH" >/dev/null 2>&1
+  ufw limit ssh/tcp >/dev/null 2>&1
+  ufw default allow outgoing >/dev/null 2>&1
+  echo "y" | ufw enable >/dev/null 2>&1
+}
+
+
+function get_ip() {
+  declare -a NODE_IPS
+  for ips in $(netstat -i | awk '!/Kernel|Iface|lo/ {print $1," "}')
+  do
+    NODE_IPS+=($(curl --interface $ips --connect-timeout 2 -s4 icanhazip.com))
+  done
+
+  if [ ${#NODE_IPS[@]} -gt 1 ]
+    then
+      echo -e "${GREEN}More than one IP. Please type 0 to use the first IP, 1 for the second and so on...${NC}"
+      INDEX=0
+      for ip in "${NODE_IPS[@]}"
+      do
+        echo ${INDEX} $ip
+        let INDEX=${INDEX}+1
+      done
+      read -e choose_ip
+      NODEIP=${NODE_IPS[$choose_ip]}
+  else
+    NODEIP=${NODE_IPS[0]}
+  fi
+}
+
 
 function compile_error() {
 if [ "$?" -gt "0" ];
  then
-  echo -e "${RED}Failed to compile $@. Please investigate.${NC}"
+  echo -e "${RED}Failed to compile $COIN_NAME. Please investigate.${NC}"
   exit 1
 fi
 }
@@ -34,19 +180,14 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-if [ -n "$(pidof $MOTILE_DAEMON)" ] || [ -e "$MOTILE_DAEMOM" ] ; then
-  echo -e "${GREEN}\c"
-  read -e -p "Motile is already installed. Do you want to add another MN? [Y/N]" NEW_MOTILE
-  echo -e "{NC}"
-  clear
-else
-  NEW_MOTILE="new"
+if [ -n "$(pidof $COIN_DAEMON)" ] || [ -e "$COIN_DAEMOM" ] ; then
+  echo -e "${RED}$COIN_NAME is already installed.${NC}"
+  exit 1
 fi
 }
 
 function prepare_system() {
-
-echo -e "Prepare the system to install Motile master node."
+echo -e "Prepare the system to install ${GREEN}$COIN_NAME${NC} master node."
 apt-get update >/dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get update > /dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y -qq upgrade >/dev/null 2>&1
@@ -57,9 +198,8 @@ echo -e "Installing required packages, it may take some time to finish.${NC}"
 apt-get update >/dev/null 2>&1
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" make software-properties-common \
 build-essential libtool autoconf libssl-dev libboost-dev libboost-chrono-dev libboost-filesystem-dev libboost-program-options-dev \
-libboost-system-dev libboost-test-dev libboost-thread-dev sudo automake git wget pwgen curl libdb4.8-dev bsdmainutils libdb4.8++-dev \
-libminiupnpc-dev libgmp3-dev ufw fail2ban >/dev/null 2>&1
-clear
+libboost-system-dev libboost-test-dev libboost-thread-dev sudo automake git wget curl libdb4.8-dev bsdmainutils libdb4.8++-dev \
+libminiupnpc-dev libgmp3-dev ufw pkg-config libevent-dev  libdb5.3++ unzip >/dev/null 2>&1
 if [ "$?" -gt "0" ];
   then
     echo -e "${RED}Not all required packages were installed properly. Try to install them manually by running the following commands:${NC}\n"
@@ -68,189 +208,34 @@ if [ "$?" -gt "0" ];
     echo "apt-add-repository -y ppa:bitcoin/bitcoin"
     echo "apt-get update"
     echo "apt install -y make build-essential libtool software-properties-common autoconf libssl-dev libboost-dev libboost-chrono-dev libboost-filesystem-dev \
-libboost-program-options-dev libboost-system-dev libboost-test-dev libboost-thread-dev sudo automake git pwgen curl libdb4.8-dev \
-bsdmainutils libdb4.8++-dev libminiupnpc-dev libgmp3-dev ufw fail2ban "
+libboost-program-options-dev libboost-system-dev libboost-test-dev libboost-thread-dev sudo automake git curl libdb4.8-dev \
+bsdmainutils libdb4.8++-dev libminiupnpc-dev libgmp3-dev ufw pkg-config libevent-dev libdb5.3++ unzip"
  exit 1
 fi
-
 clear
-echo -e "Checking if swap space is needed."
-PHYMEM=$(free -g|awk '/^Mem:/{print $2}')
-SWAP=$(free -g|awk '/^Swap:/{print $2}')
-if [ "$PHYMEM" -lt "2" ] && [ -n "$SWAP" ]
-  then
-    echo -e "${GREEN}Server is running with less than 2G of RAM without SWAP, creating 2G swap file.${NC}"
-    SWAPFILE=$(mktemp)
-    dd if=/dev/zero of=$SWAPFILE bs=1024 count=2M
-    chmod 600 $SWAPFILE
-    mkswap $SWAPFILE
-    swapon -a $SWAPFILE
-else
-  echo -e "${GREEN}Server running with at least 2G of RAM, no swap needed.${NC}"
-fi
-clear
-}
-
-function compile_node() {
-  echo -e "Clone git repo and compile it. This may take some time. Press a key to continue."
-  cd $TMP_FOLDER
-  git clone $MOTILE_REPO
-  cd MotileCoin/src
-  make -f makefile.unix
-  compile_error Motiled
-  chmod +x  Motiled
-  cp -a  Motiled /usr/local/bin
-  clear
-  cd ~
-  rm -rf $TMP_FOLDER
-}
-
-function enable_firewall() {
-  echo -e "Installing fail2ban and setting up firewall to allow ingress on port ${GREEN}$MOTILEPORT${NC}"
-  ufw allow $MOTILEPORT/tcp comment "MOTILE MN port" >/dev/null
-  ufw allow $[MOTILEPORT-1]/tcp comment "MOTILE RPC port" >/dev/null
-  ufw allow ssh comment "SSH" >/dev/null 2>&1
-  ufw limit ssh/tcp >/dev/null 2>&1
-  ufw default allow outgoing >/dev/null 2>&1
-  echo "y" | ufw enable >/dev/null 2>&1
-  systemctl enable fail2ban >/dev/null 2>&1
-  systemctl start fail2ban >/dev/null 2>&1
-}
-
-function configure_systemd() {
-  cat << EOF > /etc/systemd/system/$MOTILEUSER.service
-[Unit]
-Description=MOTILE service
-After=network.target
-
-[Service]
-ExecStart=$MOTILE_DAEMON -conf=$MOTILEFOLDER/$CONFIG_FILE -datadir=$MOTILEFOLDER
-ExecStop=$MOTILE_DAEMON -conf=$MOTILEFOLDER/$CONFIG_FILE -datadir=$MOTILEFOLDER stop
-Restart=on-abort
-User=$MOTILEUSER
-Group=$MOTILEUSER
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  sleep 3
-  systemctl start $MOTILEUSER.service
-  systemctl enable $MOTILEUSER.service
-
-  if [[ -z "$(ps axo user:15,cmd:100 | egrep ^$MOTILEUSER | grep $MOTILE_DAEMON)" ]]; then
-    echo -e "${RED}MOTILE is not running${NC}, please investigate. You should start by running the following commands as root:"
-    echo -e "${GREEN}systemctl start $MOTILEUSER.service"
-    echo -e "systemctl status $MOTILEUSER.service"
-    echo -e "less /var/log/syslog${NC}"
-    exit 1
-  fi
-}
-
-function ask_port() {
-read -p "Motile Port: " -i $DEFAULTMOTILEPORT -e MOTILEPORT
-: ${MOTILEPORT:=$DEFAULTMOTILEPORT}
-}
-
-function ask_user() {
-  read -p "Motile user: " -i $DEFAULTMOTILEUSER -e MOTILEUSER
-  : ${MOTILEUSER:=$DEFAULTMOTILEUSER}
-
-  if [ -z "$(getent passwd $MOTILEUSER)" ]; then
-    USERPASS=$(pwgen -s 12 1)
-    useradd -m $MOTILEUSER
-    echo "$MOTILEUSER:$USERPASS" | chpasswd
-
-    MOTILEHOME=$(sudo -H -u $MOTILEUSER bash -c 'echo $HOME')
-    DEFAULTMOTILEFOLDER="$MOTILEHOME/.Motile"
-    read -p "Configuration folder: " -i $DEFAULTMOTILEFOLDER -e MOTILEFOLDER
-    : ${MOTILEFOLDER:=$DEFAULTMOTILEFOLDER}
-    mkdir -p $MOTILEFOLDER
-    chown -R $MOTILEUSER: $MOTILEFOLDER >/dev/null
-  else
-    clear
-    echo -e "${RED}User exits. Please enter another username: ${NC}"
-    ask_user
-  fi
-}
-
-function check_port() {
-  declare -a PORTS
-  PORTS=($(netstat -tnlp | awk '/LISTEN/ {print $4}' | awk -F":" '{print $NF}' | sort | uniq | tr '\r\n'  ' '))
-  ask_port
-
-  while [[ ${PORTS[@]} =~ $MOTILEPORT ]] || [[ ${PORTS[@]} =~ $[MOTILEPORT-1] ]]; do
-    clear
-    echo -e "${RED}Port in use, please choose another port:${NF}"
-    ask_port
-  done
-}
-
-function create_config() {
-  RPCUSER=$(pwgen -s 8 1)
-  RPCPASSWORD=$(pwgen -s 15 1)
-  cat << EOF > $MOTILEFOLDER/$CONFIG_FILE
-rpcuser=$RPCUSER
-rpcpassword=$RPCPASSWORD
-rpcallowip=127.0.0.1
-rpcport=$[MOTILEPORT-1]
-listen=1
-server=1
-daemon=1
-port=$MOTILEPORT
-EOF
-}
-
-function create_key() {
-  echo -e "Enter your ${RED}Masternode Private Key${NC}. Leave it blank to generate a new ${RED}Masternode Private Key${NC} for you:"
-  read -e MOTILEKEY
-  if [[ -z "$MOTILEKEY" ]]; then
-  su $MOTILEUSER -c "$MOTILE_DAEMON -conf=$MOTILEFOLDER/$CONFIG_FILE -datadir=$MOTILEFOLDER"
-  sleep 5
-  if [ -z "$(ps axo user:15,cmd:100 | egrep ^$MOTILEUSER | grep $MOTILE_DAEMON)" ]; then
-   echo -e "${RED}Motile server couldn't start. Check /var/log/syslog for errors.{$NC}"
-   exit 1
-  fi
-  MOTILEKEY=$(su $MOTILEUSER -c "$MOTILE_DAEMON -conf=$MOTILEFOLDER/$CONFIG_FILE -datadir=$MOTILEFOLDER masternode genkey")
-  su $MOTILEUSER -c "$MOTILE_DAEMON -conf=$MOTILEFOLDER/$CONFIG_FILE -datadir=$MOTILEFOLDER stop"
-fi
-}
-
-function update_config() {
-  sed -i 's/daemon=1/daemon=0/' $MOTILEFOLDER/$CONFIG_FILE
-  cat << EOF >> $MOTILEFOLDER/$CONFIG_FILE
-maxconnections=256
-masternode=1
-masternodeaddr=$NODEIP:$MOTILEPORT
-masternodeprivkey=$MOTILEKEY
-EOF
-  chown -R $MOTILEUSER: $MOTILEFOLDER >/dev/null
 }
 
 function important_information() {
- echo
  echo -e "================================================================================================================================"
- echo -e "Motile Masternode is up and running as user ${GREEN}$MOTILEUSER${NC} and it is listening on port ${GREEN}$MOTILEPORT${NC}."
- echo -e "${GREEN}$MOTILEUSER${NC} password is ${RED}$USERPASS${NC}"
- echo -e "Configuration file is: ${RED}$MOTILEFOLDER/$CONFIG_FILE${NC}"
- echo -e "Start: ${RED}systemctl start $MOTILEUSER.service${NC}"
- echo -e "Stop: ${RED}systemctl stop $MOTILEUSER.service${NC}"
- echo -e "VPS_IP:PORT ${RED}$NODEIP:$MOTILEPORT${NC}"
- echo -e "MASTERNODE PRIVATEKEY is: ${RED}$MOTILEKEY${NC}"
- echo -e "Please check Motile is running with the following command: ${GREEN}systemctl status $MOTILEUSER.service${NC}"
+ echo -e "$COIN_NAME Masternode is up and running listening on port ${RED}$COIN_PORT${NC}."
+ echo -e "Configuration file is: ${RED}$CONFIGFOLDER/$CONFIG_FILE${NC}"
+ echo -e "Start: ${RED}systemctl start $COIN_NAME.service${NC}"
+ echo -e "Stop: ${RED}systemctl stop $COIN_NAME.service${NC}"
+ echo -e "VPS_IP:PORT ${RED}$NODEIP:$COIN_PORT${NC}"
+ echo -e "MASTERNODE PRIVATEKEY is: ${RED}$COINKEY${NC}"
+ echo -e "Please check ${RED}$COIN_NAME${NC} daemon is running with the following command: ${RED}systemctl status $COIN_NAME.service${NC}"
+ echo -e "Use ${RED}$COIN_CLI masternode status${NC} to check your MN. A running MN will show ${RED}Status 9${NC}."
  echo -e "================================================================================================================================"
 }
 
 function setup_node() {
-  ask_user
-  check_port
+  get_ip
   create_config
   create_key
   update_config
   enable_firewall
-  configure_systemd
   important_information
+  configure_systemd
 }
 
 
@@ -258,15 +243,7 @@ function setup_node() {
 clear
 
 checks
-if [[ ("$NEW_MOTILE" == "y" || "$NEW_MOTILE" == "Y") ]]; then
-  setup_node
-  exit 0
-elif [[ "$NEW_MOTILE" == "new" ]]; then
-  prepare_system
-  compile_node
-  setup_node
-else
-  echo -e "${GREEN}Motile already running.${NC}"
-  exit 0
-fi
+prepare_system
+download_node
+setup_node
 
